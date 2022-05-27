@@ -1,0 +1,200 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+%matplotlib inline
+
+sol = pd.read_csv('D:/converted.csv')
+sol.head(10)
+
+sol['dateInt']=sol['YEAR'].astype(str) + sol['MO'].astype(str).str.zfill(2)+ sol['DY'].astype(str).str.zfill(2)
+sol['Date'] = pd.to_datetime(sol['dateInt'], format='%Y%m%d')
+
+sol.drop(columns = ['YEAR', 'MO', 'DY', 'dateInt', 'CLRSKY_SFC_SW_DWN'], inplace=True)
+sol = sol.rename(columns = {'ALLSKY_SFC_SW_DWN' : 'GHI'})
+
+plt.figure(figsize=(20, 7))
+plt.plot(sol.Date, sol.GHI)
+plt.show()
+
+from statsmodels.tsa.stattools import adfuller
+
+def is_stationary(series):
+    X = series.values
+    result = adfuller(X)
+    print('ADF statistic: %f' %result[0])
+    print('p value: %f' %result[1]) # result[2] is Number of Lags and result[3] number of observations used
+    print('Critical Values:')
+
+    for key, val in result[4].items():
+        print('\t%s: %.3f' %(key, val))
+
+    if result[0] < result[4]["5%"]:
+        print('Reject H0 - Time series is Stationary')
+    else:
+        print('Accept H0 - Time series is Non-Stationary')
+        
+is_stationary(sol['GHI'])
+
+import statsmodels.api as sm
+from statsmodels.graphics.tsaplots import plot_acf,plot_pacf
+
+fig = plt.figure(figsize=(20,7))
+ax1 = fig.add_subplot(211)
+fig = sm.graphics.tsa.plot_acf(sol['GHI'], lags=40, ax=ax1)
+ax2 = fig.add_subplot(212)
+fig = sm.graphics.tsa.plot_pacf(sol['GHI'], lags=40, ax=ax2)
+
+# This auto_arima is used to find the p, d and q value for ARIMA model.
+from pmdarima import auto_arima
+
+stepwise_fit = auto_arima(sol['GHI'], trace=True, suppress_warnings=True)
+stepwise_fit.summary()
+
+# Split the data into training and testing
+print('Total data shape: %d' %sol.shape[0])
+
+training_size = int(len(sol)*0.7)
+train = sol.iloc[:training_size]
+test = sol.iloc[training_size+1:]
+
+print('Train Shape: %d' %train.shape[0])
+print('Test Shape: %d' %test.shape[0])
+
+import matplotlib.dates as mpl_dates
+sol.reset_index(inplace=True)
+sol['Date']=sol['Date'].apply(mpl_dates.date2num)
+sol = sol.astype(float)
+
+def norm(x):
+    return ((x - np.mean(train)) / np.std(train))
+
+normed_train = norm(train)
+normed_test = norm(test)
+
+from sklearn.metrics import r2_score, mean_squared_error
+from skimage.metrics import normalized_root_mse
+
+def model_performance_metrics(pred, actual):
+    '''
+    Takes the predicted and actual values and return r2_score, rmse, and normalized rmse
+    '''
+    #r2_score
+    r2 = r2_score(actual, pred)  # 1-(SSR/SST) where SST-sum of square of deviation and SSR-sum of square of error
+    #root mean squared error
+    rmse = np.sqrt(mean_squared_error(actual, pred))
+    #normalized root mean squared error
+    nrmse = normalized_root_mse(actual, pred)
+
+    print('R2 score: %f' %r2)
+    print('RMSE: %f' %rmse)
+    print('Normalized RMSE: %f' %nrmse)
+
+    return r2, rmse, nrmse
+    
+    
+# for using ARIMA model we need the data to be stationary
+from statsmodels.tsa.arima_model import ARIMA
+
+import warnings
+warnings.filterwarnings("ignore")
+
+from statsmodels.tsa.arima.model import ARIMA
+model = ARIMA(normed_train.GHI, order=(1,0,0))
+model = model.fit()
+model.summary()
+
+forecast = model.predict(start=1, end=767, dynamic=False)
+forecast.index = normed_train.index
+
+plt.figure(figsize=(20, 7))
+forecast.plot(legend=True, label='Forecast')
+normed_train['GHI'].plot(legend=True, label='Actual')
+plt.show()
+
+# performance on training set
+model_performance_metrics(forecast, normed_train['GHI'])
+
+start = len(normed_train)
+end = len(sol)
+pred = model.predict(start=start, end=end-2, dynamic=False)
+# performance on test set
+model_performance_metrics(pred, normed_test['GHI'])
+
+plt.figure(figsize=(20, 7))
+plt.plot(sol.Date, sol.GHI)
+plt.show()
+
+import math
+from keras.models import Sequential
+from keras.layers import Dense
+from keras.layers import LSTM
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error
+
+sol = sol.values.reshape(-1, 1)
+# normalize the dataset
+scaler = MinMaxScaler()
+sol = scaler.fit_transform(sol)
+
+# split into train and test sets
+train_size = int(len(sol) * 0.7)
+test_size = len(sol) - train_size
+train, test = sol[0:train_size,:], sol[train_size:len(sol),:]
+print(len(train), len(test))
+
+# convert an array of value into a dataset matrix
+def create_dataset(sol, look_back=1):
+    dataX, dataY = [], []
+    for i in range(len(sol)-look_back-1):
+        a = sol[i:(i+look_back), 0]
+        dataX.append(a)
+        dataY.append(sol[i + look_back, 0])
+    return np.array(dataX), np.array(dataY)
+    
+# reshape into X=t and Y=t+1
+look_back = 48
+trainX, trainY = create_dataset(train, look_back)
+testX, testY = create_dataset(test, look_back)
+
+# reshape input to be [samples, time steps, features]
+trainX = np.reshape(trainX, (trainX.shape[0], 1, trainX.shape[1]))
+testX = np.reshape(testX, (testX.shape[0], 1, testX.shape[1]))
+
+# create and fit the LSTM network
+model = Sequential()
+model.add(LSTM(4, input_shape=(1, look_back))) # input: [time_steps, features]
+model.add(Dense(1))
+model.compile(loss='mean_squared_error', optimizer='adam')
+model.fit(trainX, trainY, epochs=100, batch_size=8, verbose=1)
+
+# make predictions
+trainPredict = model.predict(trainX)
+testPredict = model.predict(testX)
+# invert predictions
+trainPredict = scaler.inverse_transform(trainPredict)
+trainY = scaler.inverse_transform([trainY])
+testPredict = scaler.inverse_transform(testPredict)
+testY = scaler.inverse_transform([testY])
+
+print('Training score:')
+model_performance_metrics(trainY[0], trainPredict[:, 0])
+print('\nTest score:')
+model_performance_metrics(testY[0], testPredict[:, 0])
+
+# shift train predictions for plotting
+trainPredictPlot = np.empty_like(sol)
+trainPredictPlot[:, :] = np.nan
+trainPredictPlot[look_back:len(trainPredict)+look_back, :] = trainPredict
+# shift test predictions for plotting
+testPredictPlot = np.empty_like(sol)
+testPredictPlot[:, :] = np.nan
+testPredictPlot[len(trainPredict)+(look_back*2)+1:len(sol)-1, :] = testPredict
+# plot baseline and predictions
+plt.figure(figsize=(20, 7))
+plt.plot(scaler.inverse_transform(sol), label='Actual')
+plt.plot(trainPredictPlot, label='Train predict')
+plt.plot(testPredictPlot, label='Test predict')
+plt.legend()
+plt.show()
